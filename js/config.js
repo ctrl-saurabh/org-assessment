@@ -24,6 +24,7 @@ window.APP_CONFIG = {
     //Client relationships
     { id: 'client_relationships', section: 'Client relationships', text: 'How is client relationship managed post the initial sales cycle? Who manages this?' },
     { id: 'recurring_revenue', section: 'Client relationships', text: 'What % of revenue is from repeat business/ account growth' },
+    { id: 'client_churn', section: 'Client relationships', text: 'When you lose a deal, who do you lose to, and why?' },
     { id: 'client_churn', section: 'Client relationships', text: 'what is the client churn rate over the last 12 months?', hint: 'CSAT, NPS, quarterly business reviews, etc.' },
 
     // Delivery
