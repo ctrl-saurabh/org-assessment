@@ -340,9 +340,8 @@
     if (code === 'not_found') return; // updated a row someone else deleted (Firestore)
     if (code === 'invalid_argument' || code === 'transform_error' || code === 'permission_denied' || code === 'unauthenticated') {
       if (kind && kind !== 'answers' && id && !findRow(kind, id)) return; // someone else deleted that row
-      setReadOnly(true, backend === 'firebase'
-        ? 'Your changes could not be saved because your account does not have write access. Ask the admin to add your email to the Firestore rules.'
-        : 'Your changes could not be saved because you have view-only access. Ask the owner to give you Contributor access.');
+      if (backend === 'firebase') return denyAccess();
+      setReadOnly(true, 'Your changes could not be saved because you have view-only access. Ask the owner to give you Contributor access.');
     } else if (code === 'quota_exceeded') {
       banner('The shared store is full (' + (e.message || 'quota reached') + '). Delete unused rows to make room.', 'bad', 'quota');
     } else if (code === 'revoked') {
@@ -398,7 +397,8 @@
         if (code === 'revoked') return setReadOnly(true, 'Your access to this shared data was withdrawn.');
         if (code === 'permission_denied' || code === 'unauthenticated') {
           banner(null, null, 'conn');
-          return setReadOnly(true, 'Your account (' + (meName || 'this account') + ') does not have access to this assessment. Ask the admin to add your email, or sign out and use another account.');
+          if (backend === 'firebase') return denyAccess();
+          return setReadOnly(true, 'You do not have access to this shared data. Ask the owner to give you Contributor access.');
         }
         if (code === 'unavailable' && attempt < 2) return setTimeout(function () { listen(k, apply, attempt + 1); }, 3000);
         banner('Lost the live connection to the shared data. Reopen the page to reconnect.', 'bad', 'conn');
@@ -1066,48 +1066,68 @@
     };
   }
 
-  function showSignIn(message) {
-    var gate = $('#signin');
+  /*
+   * Access without sign-in: the shared link carries an access code (?k=CODE). All data lives
+   * under spaces/<CODE>/…, and firestore.rules only allows that one code. The code is
+   * remembered in this browser so a bookmark without ?k= keeps working.
+   */
+  var CODE_KEY = KEY + ':code', NAME_KEY = KEY + ':name', VISITOR_KEY = KEY + ':visitor';
+  var CODE_RE = /^[A-Za-z0-9_-]{12,128}$/;
+
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
+
+  function codeFrom(text) {
+    var s = String(text || '').trim();
+    var m = s.match(/[?&]k=([^&#\s]+)/);
+    if (m) s = decodeURIComponent(m[1]);
+    return CODE_RE.test(s) ? s : null;
+  }
+
+  function linkFor(code) { return location.origin + location.pathname + '?k=' + encodeURIComponent(code); }
+
+  function showAccessGate(message) {
+    var gate = $('#accessGate');
     if (!gate) {
-      gate = el('div', { id: 'signin', class: 'modal-backdrop signin' }, el('div', { class: 'modal' }, [
-        el('h2', null, 'Sign in to continue'),
-        el('p', { id: 'signinMsg' }),
-        el('div', { class: 'modal-actions' }, el('button', { class: 'btn primary', id: 'signinBtn' }, 'Sign in with Google'))
+      gate = el('div', { id: 'accessGate', class: 'modal-backdrop signin' }, el('form', { class: 'modal', id: 'accessForm' }, [
+        el('h2', null, 'Open the assessment'),
+        el('p', { id: 'accessMsg' }),
+        el('label', { for: 'accessInput', class: 'field-label' }, 'Assessment link or access code'),
+        el('input', { id: 'accessInput', class: 'search field', autocomplete: 'off', placeholder: 'Paste the link you were sent' }),
+        el('div', { class: 'modal-actions' }, el('button', { class: 'btn primary', type: 'submit' }, 'Open'))
       ]));
       document.body.append(gate);
-      $('#signinBtn').addEventListener('click', signIn);
-    }
-    $('#signinMsg').textContent = message || 'This assessment holds confidential client and team data. Sign in with your work Google account to view and edit it.';
-    gate.hidden = false;
-  }
-
-  function signIn() {
-    var provider = new firebase.auth.GoogleAuthProvider();
-    provider.setCustomParameters({ prompt: 'select_account' });
-    fbAuth.signInWithPopup(provider).catch(function (e) {
-      var code = String(e && e.code || '');
-      if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') return fbAuth.signInWithRedirect(provider);
-      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
-      if (code === 'auth/unauthorized-domain') return showSignIn('Sign-in is not enabled for ' + location.hostname + '. The admin needs to add it under Firebase → Authentication → Settings → Authorized domains.');
-      showSignIn('Sign-in failed (' + (code || 'unknown error') + '). Try again.');
-    });
-  }
-
-  function showUserChip(email) {
-    var host = $('.topbar-actions');
-    var chip = $('#userChip');
-    if (!chip) {
-      chip = el('div', { id: 'userChip', class: 'user-chip' }, [
-        el('span', { id: 'userEmail' }),
-        el('button', { class: 'btn', id: 'signOutBtn' }, 'Sign out')
-      ]);
-      host.insertBefore(chip, $('.menu', host));
-      $('#signOutBtn').addEventListener('click', function () {
-        flush();
-        fbAuth.signOut().then(function () { location.reload(); });
+      $('#accessForm').addEventListener('submit', function (e) {
+        e.preventDefault();
+        var code = codeFrom($('#accessInput').value);
+        if (!code) { $('#accessMsg').textContent = 'That doesn’t look like an assessment link. Paste the whole link, including the part after “?k=”.'; return; }
+        lsSet(CODE_KEY, code);
+        location.href = linkFor(code) + location.hash;
       });
     }
-    $('#userEmail').textContent = email;
+    $('#accessMsg').textContent = message || 'This assessment holds confidential client and team data. Open it with the link you were sent.';
+    gate.hidden = false;
+    $('#accessInput').focus();
+  }
+
+  function denyAccess() {
+    lsSet(CODE_KEY, null);
+    readOnly = true;
+    applyReadOnly();
+    setStatus('No access');
+    showAccessGate('This link’s access code isn’t valid, possibly because it was changed. Ask the assessment owner for the current link.');
+  }
+
+  function showNameField() {
+    var host = $('.topbar-actions');
+    if ($('#myName')) return;
+    var input = el('input', { id: 'myName', class: 'name-input', placeholder: 'Your name', 'aria-label': 'Your name, shown next to answers you edit', title: 'Shown next to answers you edit' });
+    input.value = meName || '';
+    input.addEventListener('change', function () {
+      meName = input.value.trim();
+      lsSet(NAME_KEY, meName || null);
+    });
+    host.insertBefore(input, $('.menu', host));
   }
 
   function startFirebase() {
@@ -1115,32 +1135,30 @@
     backend = 'firebase';
     isAdmin = false;
     updateMenu();
-    setStatus('Signing in…');
-    setIntro('Everyone signed in to this assessment sees and edits the same answers. Changes save automatically.');
+    setIntro('Everyone with the assessment link sees and edits the same answers. Changes save automatically.');
     renderAll();
+
+    var fromUrl = codeFrom(location.search);
+    var code = fromUrl || codeFrom(lsGet(CODE_KEY));
+    if (!code) { setStatus('No access code'); showAccessGate(); return; }
+    lsSet(CODE_KEY, code);
+
+    meId = lsGet(VISITOR_KEY);
+    if (!meId) { meId = 'v' + uid(); lsSet(VISITOR_KEY, meId); }
+    meName = lsGet(NAME_KEY) || '';
+    isAdmin = true;   // anyone with the link can use every menu item; the confirm dialogs guard the destructive ones
+    showNameField();
+    updateMenu();
+
     try {
       if (!firebase.apps.length) firebase.initializeApp(FB.config);
-      fbAuth = firebase.auth();
-      db = firestoreAdapter(firebase.firestore());
+      var space = firebase.firestore().collection('spaces').doc(code);
+      db = firestoreAdapter(space);
     } catch (e) {
       return startLocal('Could not start Firebase (' + (e && e.message || 'configuration error') + '). Check the firebase settings in js/config.js. Anything you type stays in this browser only.');
     }
-    fbAuth.getRedirectResult().catch(function (e) { showSignIn('Sign-in failed (' + ((e && e.code) || 'unknown error') + '). Try again.'); });
-    var started = false;
-    fbAuth.onAuthStateChanged(function (u) {
-      if (!u) { setStatus('Signed out'); showSignIn(); return; }
-      var gate = $('#signin'); if (gate) gate.hidden = true;
-      if (started) return;
-      started = true;
-      meId = u.uid;
-      meName = u.displayName || u.email || '';
-      var email = String(u.email || '').toLowerCase();
-      isAdmin = (FB.admins || []).some(function (a) { return String(a).toLowerCase() === email; });
-      showUserChip(u.email || meName);
-      setStatus('Connecting…');
-      updateMenu();
-      subscribe();
-    });
+    setStatus('Connecting…');
+    subscribe();
   }
 
   /* ---------------- claude.ai Artifact backend ---------------- */

@@ -14,9 +14,9 @@ window.APP_CONFIG = {
   locale: 'en-US', // e.g. 'en-IN' or 'en-US'; undefined = browser default
 
   /*
-   * Shared storage (Firebase Firestore + Google sign-in). See README → "Set up Firebase".
-   * Paste the values from Firebase console → Project settings → Your apps → Web app.
-   * These values are not secret; access is controlled by firestore.rules.
+   * Shared storage (Firebase Firestore). See README → "Set up Firebase".
+   * These values are not secret. Access is controlled by the access code in the shared
+   * link (?k=CODE), which firestore.rules checks. Never put the code in this repo.
    * While apiKey is empty, the site keeps data in each person's browser only.
    */
   firebase: {
@@ -27,10 +27,7 @@ window.APP_CONFIG = {
       storageBucket: 'org-assessment-5c7e3.firebasestorage.app',
       messagingSenderId: '128650520875',
       appId: '1:128650520875:web:e04db83502c9e4047fbd6e'
-    },
-    // Emails that see "Import JSON backup" and "Clear all shared data". This only hides
-    // the menu items; who can read and write at all is set in firestore.rules.
-    admins: []
+    }
   },
 
   questions: [

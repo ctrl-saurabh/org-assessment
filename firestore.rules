@@ -1,29 +1,22 @@
 rules_version = '2';
 
 // Who can read and write the assessment data.
-// Paste this into Firebase console → Firestore Database → Rules, edit the two lists, then Publish.
-// The website is public; these rules are what keep the data private.
+//
+// There is no sign-in. The shared link carries an access code (…/org-assessment/?k=CODE),
+// and all data lives under spaces/<CODE>/. Only requests that know the code get in.
+//
+// THIS FILE IS PUBLIC, so it holds a placeholder. Do not commit the real code.
+// Paste this into Firebase console → Firestore Database → Rules, replace
+// REPLACE_WITH_ACCESS_CODE with your code, then click Publish.
+// To cut everyone off (e.g. a link leaked), publish a new code and share the new link.
+// The data stays under the old code, so export it first and import it after switching.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function signedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+    match /spaces/{code}/{collection}/{id} {
+      allow read, write: if code == 'REPLACE_WITH_ACCESS_CODE'
+                         && collection in ['clients', 'team', 'answers'];
     }
-
-    function allowed() {
-      return signedIn() && (
-        // 1) Individual people (lower-case emails)
-        request.auth.token.email.lower() in [
-          'someone@example.com'
-        ]
-        // 2) Everyone on your company's Google Workspace domain — change example.com, or delete this line
-        || request.auth.token.email.lower().matches('.*@circulants[.]com$')
-      );
-    }
-
-    match /clients/{id} { allow read, write: if allowed(); }
-    match /team/{id}    { allow read, write: if allowed(); }
-    match /answers/{id} { allow read, write: if allowed(); }
 
     // Everything else is closed.
     match /{document=**} { allow read, write: if false; }

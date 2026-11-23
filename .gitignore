@@ -3,3 +3,6 @@
 org-assessment-*.json
 .DS_Store
 Thumbs.db
+
+# Real Firestore rules with the access code - never commit
+firestore.rules.local
