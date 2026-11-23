@@ -56,15 +56,6 @@ window.APP_CONFIG = {
     clients: [
       { key: 'client', label: 'Client', type: 'text', width: 180, placeholder: 'Client name' },
       { key: 'tier', label: 'Tier', type: 'select', width: 120, options: ['Strategic', 'Growth', 'Maintain'] },
-      { key: 'revenue', label: 'Annual revenue', type: 'currency', width: 140, min: 0 },
-      {
-        key: 'revenueShare', label: '% of total revenue', type: 'computed', format: 'percent', width: 110,
-        help: 'Calculated automatically from Annual revenue across all clients listed',
-        compute: function (row, rows) {
-          var total = rows.reduce(function (s, r) { return s + (Number(r.revenue) || 0); }, 0);
-          return total ? (Number(row.revenue) || 0) / total * 100 : null;
-        }
-      },
       { key: 'grossMargin', label: 'Gross margin %', type: 'percent', width: 110, min: -100, max: 100 },
       {
         key: 'contractType', label: 'Contract type', type: 'select', width: 130,

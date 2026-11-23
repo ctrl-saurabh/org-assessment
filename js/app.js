@@ -747,25 +747,17 @@
   }
 
   function summaryClients(host, rows) {
-    var rev = 0, revWithGm = 0, gmWeighted = 0;
-    rows.forEach(function (r) {
-      var v = num(r.revenue) || 0, gm = num(r.grossMargin);
-      rev += v;
-      if (gm != null && v) { revWithGm += v; gmWeighted += v * gm; }
-    });
-    var top = rows.slice().sort(function (a, b) { return (num(b.revenue) || 0) - (num(a.revenue) || 0); })[0];
-    var topShare = rev && top ? (num(top.revenue) || 0) / rev * 100 : null;
+    var gms = rows.map(function (r) { return num(r.grossMargin); }).filter(function (x) { return x != null; });
+    var avgGm = gms.length ? gms.reduce(function (a, b) { return a + b; }, 0) / gms.length : null;
     var renewals = rows.filter(function (r) { var d = daysUntil(r.contractEnd); return d != null && d <= 90; });
     var escal = rows.filter(function (r) { return String(r.escalations || '').trim(); }).length;
 
     host.append(
       card('Active clients', rows.length,
         countBy(rows, 'tier', 'Strategic') + ' strategic · ' + countBy(rows, 'tier', 'Growth') + ' growth · ' + countBy(rows, 'tier', 'Maintain') + ' maintain'),
-      card('Total annual revenue', fmtMoney(rev, true)),
-      card('Weighted gross margin', revWithGm ? fmtPct(gmWeighted / revWithGm) : '—', 'Weighted by revenue'),
+      card('Avg gross margin', fmtPct(avgGm), gms.length + ' of ' + rows.length + ' clients reported'),
       card('Health', [pill('G ' + countBy(rows, 'health', 'G'), 'good'), pill('A ' + countBy(rows, 'health', 'A'), 'warn'), pill('R ' + countBy(rows, 'health', 'R'), 'bad')]),
       card('Renewals ≤ 90 days', renewals.length, renewals.length ? renewals.map(function (r) { return r.client || '(unnamed)'; }).slice(0, 3).join(', ') + (renewals.length > 3 ? '…' : '') : 'Includes lapsed contracts'),
-      card('Largest client share', topShare == null ? '—' : fmtPct(topShare), top && top.client ? top.client : 'Concentration risk'),
       card('With open escalations', escal)
     );
   }
