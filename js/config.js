@@ -21,10 +21,12 @@ window.APP_CONFIG = {
    */
   firebase: {
     config: {
-      apiKey: '',
-      authDomain: '',
-      projectId: '',
-      appId: ''
+      apiKey: 'AIzaSyAd7BX7ghmaJDAR8k-OUES2lTxFtNygep0',
+      authDomain: 'org-assessment-5c7e3.firebaseapp.com',
+      projectId: 'org-assessment-5c7e3',
+      storageBucket: 'org-assessment-5c7e3.firebasestorage.app',
+      messagingSenderId: '128650520875',
+      appId: '1:128650520875:web:e04db83502c9e4047fbd6e'
     },
     // Emails that see "Import JSON backup" and "Clear all shared data". This only hides
     // the menu items; who can read and write at all is set in firestore.rules.

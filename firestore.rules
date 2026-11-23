@@ -17,7 +17,7 @@ service cloud.firestore {
           'someone@example.com'
         ]
         // 2) Everyone on your company's Google Workspace domain — change example.com, or delete this line
-        || request.auth.token.email.lower().matches('.*@example[.]com$')
+        || request.auth.token.email.lower().matches('.*@circulants[.]com$')
       );
     }
 
