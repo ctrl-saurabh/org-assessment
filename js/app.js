@@ -1,16 +1,39 @@
 (function () {
   'use strict';
 
+  /*
+   * Two storage modes, one codebase:
+   *  - "shared": running inside claude.ai as an Artifact. Data lives in the artifact's
+   *    shared database (collections: clients, team, answers) and syncs live between people.
+   *  - "local":  anywhere else (GitHub Pages, a local file). Data lives in this browser's
+   *    localStorage; data/seed.json is loaded on first visit.
+   */
+
   var C = window.APP_CONFIG;
   var KEY = C.storageKey || 'org-assessment-v1';
   var KINDS = ['clients', 'team'];
   var NUMERIC = ['number', 'currency', 'percent'];
   var LABELS = { clients: { one: 'client', add: '+ Add client' }, team: { one: 'person', add: '+ Add person' } };
+  var ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+  var inViewer = !!(window.claude && typeof window.claude.use === 'function');
+  var mode = 'local';
+  var db = null, userNs = null, downloadsNs = null, meId = null;
+  var readOnly = false, isAdmin = true;
 
   var state = emptyState();
+  var answerMeta = {};                       // qid -> { by, at } (shared mode)
   var views = { clients: { sort: null, dir: 1, filter: '' }, team: { sort: null, dir: 1, filter: '' } };
-  var saveTimer = null;
-  var pendingImport = null;
+  var loaded = { clients: false, team: false, answers: false };
+  var rendered = { clients: false, team: false };
+  var saveTimer = null, pendingImport = null;
+
+  // shared-mode write queue
+  var pending = { clients: {}, team: {}, answers: {} };   // fields waiting to be sent
+  var sending = { clients: {}, team: {}, answers: {} };   // fields in flight
+  var creating = {};                                       // 'kind/id' -> promise of the initial set()
+  var retries = {};
+  var flushTimer = null, activeWrites = 0;
 
   /* ---------------- helpers ---------------- */
   function $(s, root) { return (root || document).querySelector(s); }
@@ -42,6 +65,8 @@
   function colByKey(kind, key) { return cols(kind).filter(function (c) { return c.key === key; })[0]; }
   function opts(c) { return (c.options || []).map(function (o) { return typeof o === 'string' ? { value: o, label: o } : o; }); }
   function daysUntil(iso) { if (!iso) return null; var d = new Date(iso + 'T00:00:00'); if (isNaN(d)) return null; var t = new Date(); t.setHours(0, 0, 0, 0); return Math.round((d - t) / 864e5); }
+  function byCreated(a, b) { return (a._created || 0) - (b._created || 0) || String(a.id).localeCompare(String(b.id)); }
+  function findRow(kind, id) { return state[kind].filter(function (r) { return r.id === id; })[0]; }
 
   function fmtMoney(n, compact) {
     if (n == null || isNaN(n)) return '—';
@@ -55,47 +80,369 @@
     if (c.format === 'currency') return fmtMoney(v);
     return v == null ? '—' : String(v);
   }
+  function fmtWhen(ms) {
+    var d = new Date(ms);
+    if (isNaN(d)) return '';
+    return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ', ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
   function computedValue(kind, c, row) { return c.compute ? c.compute(row, state[kind]) : null; }
 
-  /* ---------------- persistence ---------------- */
+  function runLimited(tasks, n) {
+    var i = 0;
+    function worker() { if (i >= tasks.length) return Promise.resolve(); var t = tasks[i++]; return t().then(worker); }
+    var ws = [];
+    for (var k = 0; k < Math.min(n, tasks.length); k++) ws.push(worker());
+    return Promise.all(ws);
+  }
+
+  /* ---------------- UI chrome: banners, toast, confirm dialog ---------------- */
+  function buildChrome() {
+    $('main').prepend(el('div', { id: 'banners' }));
+    document.body.append(el('div', { id: 'toast', class: 'toast', role: 'status', 'aria-live': 'polite', hidden: true }));
+    document.body.append(el('div', { id: 'modal', class: 'modal-backdrop', hidden: true }, el('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'modalTitle' }, [
+      el('h2', { id: 'modalTitle' }),
+      el('p', { id: 'modalMsg' }),
+      el('div', { class: 'modal-actions' }, [
+        el('button', { class: 'btn', id: 'modalCancel' }, 'Cancel'),
+        el('button', { class: 'btn primary', id: 'modalOk' }, 'OK')
+      ])
+    ])));
+  }
+
+  function banner(msg, tone, key) {
+    key = key || 'b' + Math.random().toString(36).slice(2, 6);
+    var host = $('#banners');
+    var old = $('[data-banner="' + key + '"]', host);
+    if (old) old.remove();
+    if (msg) host.append(el('div', { class: 'banner tone-' + (tone || 'warn'), 'data-banner': key }, msg));
+  }
+
+  var toastTimer = null;
+  function toast(msg, ms) {
+    var t = $('#toast');
+    t.textContent = msg;
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.hidden = true; }, ms || 3500);
+  }
+
+  function askConfirm(title, message, okLabel, danger) {
+    return new Promise(function (resolve) {
+      var m = $('#modal'), ok = $('#modalOk'), cancel = $('#modalCancel');
+      $('#modalTitle').textContent = title;
+      $('#modalMsg').textContent = message;
+      ok.textContent = okLabel || 'OK';
+      ok.classList.toggle('danger', !!danger);
+      m.hidden = false;
+      cancel.focus();
+      function done(v) {
+        m.hidden = true;
+        ok.removeEventListener('click', onOk); cancel.removeEventListener('click', onCancel);
+        m.removeEventListener('click', onBackdrop); document.removeEventListener('keydown', onKey, true);
+        resolve(v);
+      }
+      function onOk() { done(true); }
+      function onCancel() { done(false); }
+      function onBackdrop(e) { if (e.target === m) done(false); }
+      function onKey(e) { if (e.key === 'Escape') { e.stopPropagation(); done(false); } }
+      ok.addEventListener('click', onOk); cancel.addEventListener('click', onCancel);
+      m.addEventListener('click', onBackdrop); document.addEventListener('keydown', onKey, true);
+    });
+  }
+
+  function setStatus(t, err) { var s = $('#saveStatus'); s.textContent = t; s.classList.toggle('err', !!err); }
+
+  /* ---------------- state shape ---------------- */
   function emptyState() { return { version: 1, updatedAt: null, answers: {}, clients: [], team: [] }; }
 
   function normalize(s) {
     s = s || {};
     var out = emptyState();
     out.updatedAt = s.updatedAt || null;
-    out.answers = s.answers && typeof s.answers === 'object' ? s.answers : {};
+    if (s.answers && typeof s.answers === 'object') {
+      Object.keys(s.answers).forEach(function (k) { if (ID_RE.test(k)) out.answers[k] = String(s.answers[k] == null ? '' : s.answers[k]); });
+    }
+    var t0 = Date.now();
     KINDS.forEach(function (k) {
-      out[k] = Array.isArray(s[k]) ? s[k].map(function (r) { return Object.assign({}, r, { id: r.id || uid() }); }) : [];
+      out[k] = Array.isArray(s[k]) ? s[k].map(function (r, i) {
+        var row = Object.assign({}, r);
+        if (!row.id || !ID_RE.test(String(row.id))) row.id = uid();
+        if (!row._created) row._created = t0 + i;
+        return row;
+      }) : [];
     });
     return out;
   }
 
-  function save() {
+  /* ---------------- local mode persistence ---------------- */
+  function saveLocal() {
     clearTimeout(saveTimer); saveTimer = null;
     state.updatedAt = new Date().toISOString();
     try {
       localStorage.setItem(KEY, JSON.stringify(state));
-      setStatus('Saved ' + new Date(state.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+      setStatus('Saved ' + new Date(state.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' · this browser only');
     } catch (e) {
       setStatus('Not saved: browser storage unavailable. Export to keep your data.', true);
     }
     refreshDatalists();
   }
-  function scheduleSave() { setStatus('Saving…'); clearTimeout(saveTimer); saveTimer = setTimeout(save, 400); }
-  function setStatus(t, err) { var s = $('#saveStatus'); s.textContent = t; s.classList.toggle('err', !!err); }
+  function scheduleLocalSave() { setStatus('Saving…'); clearTimeout(saveTimer); saveTimer = setTimeout(saveLocal, 400); }
 
-  function load() {
+  function loadLocal() {
     var raw = null;
     try { raw = localStorage.getItem(KEY); } catch (e) { /* ignore */ }
     if (raw) {
       try { state = normalize(JSON.parse(raw)); return Promise.resolve(); } catch (e) { /* fall through */ }
     }
-    // First visit in this browser: optionally load starter data committed to the repo
     return fetch('data/seed.json', { cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) { if (j) state = normalize(j); })
-      .catch(function () { /* opened via file:// or no seed — start empty */ });
+      .catch(function () { /* no seed — start empty */ });
+  }
+
+  /* ---------------- mutations (both modes) ---------------- */
+  function commitField(kind, row, key, value) {
+    row[key] = value;
+    if (mode === 'local') return scheduleLocalSave();
+    var f = {}; f[key] = value;
+    queueWrite(kind, row.id, f);
+  }
+
+  function commitAnswer(qid, text) {
+    state.answers[qid] = text;
+    if (mode === 'local') return scheduleLocalSave();
+    queueWrite('answers', qid, { text: text });
+  }
+
+  function docBody(row) {
+    var b = Object.assign({}, row);
+    delete b.id;
+    b._by = meId; b._at = Date.now();
+    return b;
+  }
+
+  function createRows(kind, rows) {
+    var t0 = Date.now();
+    rows.forEach(function (r, i) { if (!r._created) r._created = t0 + i; state[kind].push(r); });
+    state[kind].sort(byCreated);
+    if (mode === 'local') { saveLocal(); return Promise.resolve(); }
+    setStatus('Saving…');
+    return runLimited(rows.map(function (r) {
+      return function () {
+        var key = kind + '/' + r.id;
+        var p = db.collection(kind).doc(r.id).set(docBody(r));
+        creating[key] = p;
+        return p.then(function () { delete creating[key]; }, function (e) { delete creating[key]; handleWriteError(e, kind, r.id); });
+      };
+    }), 5).then(updateSaveStatus);
+  }
+
+  function removeRow(kind, id) {
+    state[kind] = state[kind].filter(function (r) { return r.id !== id; });
+    if (mode === 'local') return saveLocal();
+    delete pending[kind][id];
+    var before = creating[kind + '/' + id] || Promise.resolve();
+    before.then(function () { return db.collection(kind).doc(id).delete(); })
+      .catch(function (e) { handleWriteError(e, kind, null); });
+  }
+
+  function replaceAll(ns) {
+    if (mode === 'local') { state = ns; saveLocal(); renderAll(); return Promise.resolve(); }
+    pending = { clients: {}, team: {}, answers: {} };
+    setStatus('Replacing shared data…');
+    var dels = [];
+    KINDS.forEach(function (k) { state[k].forEach(function (r) { dels.push(function () { return db.collection(k).doc(r.id).delete(); }); }); });
+    Object.keys(state.answers).forEach(function (q) { dels.push(function () { return db.collection('answers').doc(q).delete(); }); });
+    var creates = [];
+    KINDS.forEach(function (k) { ns[k].forEach(function (r) { creates.push(function () { return db.collection(k).doc(r.id).set(docBody(r)); }); }); });
+    Object.keys(ns.answers).forEach(function (q) {
+      if (String(ns.answers[q]).trim()) creates.push(function () { return db.collection('answers').doc(q).set({ text: ns.answers[q], _by: meId, _at: Date.now() }); });
+    });
+    return runLimited(dels, 5)
+      .then(function () { return runLimited(creates, 5); })
+      .then(function () { toast('Shared data replaced'); }, function (e) { handleWriteError(e); })
+      .then(updateSaveStatus);
+  }
+
+  /* ---------------- shared mode: write queue ---------------- */
+  function queueWrite(kind, id, fields) {
+    pending[kind][id] = Object.assign(pending[kind][id] || {}, fields);
+    setStatus('Saving…');
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, 600);
+  }
+
+  function flush() {
+    clearTimeout(flushTimer); flushTimer = null;
+    ['clients', 'team', 'answers'].forEach(function (kind) {
+      Object.keys(pending[kind]).forEach(function (id) { sendDoc(kind, id); });
+    });
+  }
+
+  // One write at a time per document; later edits wait for the one in flight.
+  function sendDoc(kind, id) {
+    if (sending[kind][id] || !pending[kind][id]) return;
+    var fields = pending[kind][id];
+    delete pending[kind][id];
+    sending[kind][id] = fields;
+    activeWrites++;
+    var key = kind + '/' + id;
+    var ref = db.collection(kind).doc(id);
+    var meta = { _by: meId, _at: Date.now() };
+    var before = creating[key] || Promise.resolve();
+    before.then(function () {
+      return kind === 'answers' ? ref.set(Object.assign({}, fields, meta)) : ref.update(Object.assign({}, fields, meta));
+    }).then(function () {
+      delete retries[key];
+    }, function (e) {
+      if (e && e.code === 'unavailable' && (retries[key] || 0) < 3) {
+        retries[key] = (retries[key] || 0) + 1;
+        pending[kind][id] = Object.assign({}, fields, pending[kind][id] || {});
+        setTimeout(flush, 1000 + Math.random() * 1500);
+      } else {
+        handleWriteError(e, kind, id);
+      }
+    }).then(function () {
+      delete sending[kind][id];
+      activeWrites--;
+      if (pending[kind][id] && !flushTimer) sendDoc(kind, id);
+      updateSaveStatus();
+    });
+  }
+
+  function hasUnsaved() {
+    if (mode === 'local') return !!saveTimer;
+    return activeWrites > 0 || ['clients', 'team', 'answers'].some(function (k) { return Object.keys(pending[k]).length > 0; });
+  }
+
+  function updateSaveStatus() {
+    if (mode !== 'shared' || readOnly) return;
+    if (hasUnsaved()) return setStatus('Saving…');
+    if (!loaded.clients || !loaded.team || !loaded.answers) return setStatus('Connecting…');
+    setStatus('All changes saved · shared');
+  }
+
+  function handleWriteError(e, kind, id) {
+    var code = e && e.code;
+    if (code === 'invalid_argument' || code === 'transform_error') {
+      if (kind && kind !== 'answers' && id && !findRow(kind, id)) return; // someone else deleted that row
+      setReadOnly(true, 'Your changes could not be saved because you have view-only access. Ask the owner to give you Contributor access.');
+    } else if (code === 'quota_exceeded') {
+      banner('The shared store is full (' + (e.message || 'quota reached') + '). Delete unused rows to make room.', 'bad', 'quota');
+    } else if (code === 'revoked') {
+      setReadOnly(true, 'Your access to this shared data was withdrawn.');
+    } else if (code === 'resource_exhausted') {
+      banner('Too many changes at once. Wait a few seconds, then make your last edit again.', 'warn', 'rate');
+    } else {
+      banner('A change could not be saved (' + (code || 'unknown error') + '). Check your connection and make the edit again.', 'warn', 'save');
+    }
+    updateSaveStatus();
+  }
+
+  function setReadOnly(flag, msg) {
+    readOnly = flag;
+    if (msg) banner(msg, 'bad', 'readonly');
+    if (flag) setStatus('View only');
+    applyReadOnly();
+    updateMenu();
+  }
+
+  function applyReadOnly() {
+    document.body.classList.toggle('read-only', readOnly);
+    $$('main input:not(.search), main select, main textarea').forEach(function (e) { e.disabled = readOnly; });
+  }
+
+  function updateMenu() {
+    var adminOnly = mode === 'shared' && (!isAdmin || readOnly);
+    $$('[data-action="import-json"], [data-action="reset"]').forEach(function (b) { b.hidden = adminOnly; });
+    var hr = $('#dataMenu hr'); if (hr) hr.hidden = adminOnly;
+    var r = $('[data-action="reset"]');
+    if (r) r.textContent = mode === 'shared' ? 'Clear all shared data…' : 'Clear all data…';
+  }
+
+  /* ---------------- shared mode: live subscriptions ---------------- */
+  function subscribe() {
+    var timer = setTimeout(function () {
+      if (!(loaded.clients && loaded.team && loaded.answers)) banner('Still connecting to the shared data. What you see may be incomplete or out of date.', 'warn', 'conn');
+    }, 10000);
+    function markLoaded(k, snap) {
+      if (snap.metadata.fromCache) return;
+      if (!loaded[k]) {
+        loaded[k] = true;
+        if (k !== 'answers') renderTableKeepFocus(k);
+      }
+      if (loaded.clients && loaded.team && loaded.answers) { clearTimeout(timer); banner(null, null, 'conn'); }
+      updateSaveStatus();
+    }
+    function listen(k, apply, attempt) {
+      db.collection(k).onSnapshot(function (snap) { apply(snap); markLoaded(k, snap); }, function (e) {
+        clearTimeout(timer);
+        if (e && e.code === 'revoked') return setReadOnly(true, 'Your access to this shared data was withdrawn.');
+        if (e && e.code === 'unavailable' && attempt < 2) return setTimeout(function () { listen(k, apply, attempt + 1); }, 3000);
+        banner('Lost the live connection to the shared data. Reopen the page to reconnect.', 'bad', 'conn');
+      });
+    }
+    KINDS.forEach(function (k) { listen(k, function (snap) { applyRows(k, snap); }, 0); });
+    listen('answers', applyAnswers, 0);
+  }
+
+  function applyRows(kind, snap) {
+    var before = {};
+    state[kind].forEach(function (r) { before[r.id] = r; });
+    var seen = {};
+    var rows = snap.docs.map(function (d) {
+      seen[d.id] = 1;
+      var r = Object.assign({}, d.data(), sending[kind][d.id] || {}, pending[kind][d.id] || {});
+      r.id = d.id;
+      return r;
+    });
+    // keep rows this view just created that the store hasn't echoed yet
+    state[kind].forEach(function (r) { if (!seen[r.id] && creating[kind + '/' + r.id]) rows.push(r); });
+    rows.sort(byCreated);
+    var structural = rows.length !== state[kind].length || rows.some(function (r) { return !before[r.id]; });
+    state[kind] = rows;
+    if (structural || !rendered[kind]) renderTableKeepFocus(kind);
+    else {
+      snap.docChanges().forEach(function (c) { if (c.type === 'modified') patchRow(kind, c.doc.id); });
+      refreshComputed(kind);
+      renderSummary(kind);
+    }
+    refreshDatalists();
+  }
+
+  function applyAnswers(snap) {
+    var ids = {};
+    snap.docs.forEach(function (d) {
+      ids[d.id] = 1;
+      var data = d.data() || {};
+      var local = pending.answers[d.id] || sending.answers[d.id];
+      state.answers[d.id] = local ? local.text : String(data.text == null ? '' : data.text);
+      answerMeta[d.id] = { by: data._by || null, at: data._at || null };
+    });
+    Object.keys(state.answers).forEach(function (k) {
+      if (!ids[k] && !pending.answers[k] && !sending.answers[k]) { delete state.answers[k]; delete answerMeta[k]; }
+    });
+    $$('#questions textarea[data-qid]').forEach(function (ta) {
+      var v = state.answers[ta.dataset.qid] || '';
+      if (ta !== document.activeElement && ta.value !== v) ta.value = v;
+      ta.closest('.q').classList.toggle('answered', !!ta.value.trim());
+    });
+    updateProgress();
+    renderAnswerMeta();
+  }
+
+  function renderAnswerMeta() {
+    if (mode !== 'shared') return;
+    var ids = uniq(Object.keys(answerMeta).map(function (k) { return answerMeta[k].by; }));
+    var resolve = userNs && ids.length ? userNs.profiles(ids) : Promise.resolve({});
+    resolve.then(function (ps) {
+      $$('#questions [data-meta-for]').forEach(function (p) {
+        var m = answerMeta[p.dataset.metaFor];
+        if (!m || !m.at || !(state.answers[p.dataset.metaFor] || '').trim()) { p.textContent = ''; return; }
+        var who = m.by && ps[m.by] ? (ps[m.by].isMe ? 'you' : (ps[m.by].name || 'someone')) : 'someone';
+        p.textContent = 'Last edited by ' + who + ' · ' + fmtWhen(m.at);
+      });
+    });
   }
 
   /* ---------------- routing ---------------- */
@@ -104,7 +451,6 @@
     if (['questions', 'clients', 'team'].indexOf(tab) < 0) tab = 'questions';
     $$('.view').forEach(function (v) { v.hidden = v.id !== 'view-' + tab; });
     $$('.tabs a').forEach(function (a) { a.classList.toggle('active', a.dataset.tab === tab); });
-    // textareas can only be measured once visible
     requestAnimationFrame(function () { $$('#view-' + tab + ' .grid textarea').forEach(autosize); });
   }
 
@@ -133,12 +479,13 @@
         ]);
         var ta = el('textarea', { id: id, rows: 3, 'data-qid': q.id, placeholder: 'Your notes…' });
         ta.value = val;
-        wrap.append(ta);
+        wrap.append(ta, el('p', { class: 'q-meta', 'data-meta-for': q.id }));
         card.append(wrap);
       });
       host.append(card);
     });
     updateProgress();
+    renderAnswerMeta();
   }
 
   function updateProgress() {
@@ -178,7 +525,7 @@
       rows.sort(function (a, b) {
         var x = sortVal(kind, c, a), y = sortVal(kind, c, b);
         if (x == null && y == null) return 0;
-        if (x == null) return 1;          // empties always last
+        if (x == null) return 1;
         if (y == null) return -1;
         var d = (typeof x === 'number' && typeof y === 'number') ? x - y
           : String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
@@ -209,10 +556,15 @@
     var rows = visibleRows(kind);
     tbody.innerHTML = '';
     rows.forEach(function (row) { tbody.append(renderRow(kind, row)); });
+    rendered[kind] = true;
 
     var empty = $('#empty-' + kind);
-    if (!state[kind].length) {
-      empty.textContent = 'Nothing here yet. Click “' + LABELS[kind].add + '” or use Import CSV (Export CSV on an empty table gives you a template).';
+    if (mode === 'shared' && !loaded[kind] && !state[kind].length) {
+      empty.textContent = 'Loading shared data…';
+      empty.hidden = false;
+    } else if (!state[kind].length) {
+      empty.textContent = readOnly ? 'No ' + kind + ' have been added yet.'
+        : 'Nothing here yet. Click “' + LABELS[kind].add + '” or use Import CSV. Export CSV on an empty table gives you a template.';
       empty.hidden = false;
     } else if (!rows.length) {
       empty.textContent = 'No rows match “' + v.filter + '”.';
@@ -222,6 +574,20 @@
     requestAnimationFrame(function () { $$('textarea', tbody).forEach(autosize); });
     renderSummary(kind);
     updateCounts();
+    applyReadOnly();
+  }
+
+  function renderTableKeepFocus(kind) {
+    var a = document.activeElement, info = null;
+    if (a && a.closest && a.closest('#table-' + kind + ' tbody') && a.dataset.key) {
+      info = { id: a.closest('tr').dataset.id, key: a.dataset.key, s: null, e: null };
+      try { info.s = a.selectionStart; info.e = a.selectionEnd; } catch (err) { /* not a text field */ }
+    }
+    renderTable(kind);
+    if (info) {
+      var f = $('#table-' + kind + ' tr[data-id="' + info.id + '"] [data-key="' + info.key + '"]');
+      if (f) { f.focus(); try { if (info.s != null) f.setSelectionRange(info.s, info.e); } catch (err) { /* ignore */ } }
+    }
   }
 
   function renderRow(kind, row) {
@@ -230,8 +596,8 @@
       tr.append(el('td', { 'data-col': c.key }, editor(kind, c, row)));
     });
     tr.append(el('td', { class: 'actions' }, [
-      el('button', { class: 'icon-btn', 'data-action': 'dup-row', title: 'Duplicate row' }, '⧉'),
-      el('button', { class: 'icon-btn danger', 'data-action': 'del-row', title: 'Delete row' }, '✕')
+      el('button', { class: 'icon-btn', 'data-action': 'dup-row', title: 'Duplicate row', 'aria-label': 'Duplicate row' }, '⧉'),
+      el('button', { class: 'icon-btn danger', 'data-action': 'del-row', title: 'Delete row', 'aria-label': 'Delete row' }, '✕')
     ]));
     return tr;
   }
@@ -246,7 +612,7 @@
       case 'select':
         e = el('select', base, el('option', { value: '' }, '—'));
         opts(c).forEach(function (o) { e.append(el('option', { value: o.value }, o.label)); });
-        if (val !== '' && !opts(c).some(function (o) { return o.value === String(val); })) e.append(el('option', { value: val }, val));
+        ensureOption(e, val);
         e.value = val;
         applyTone(e, c);
         return e;
@@ -271,9 +637,31 @@
     }
   }
 
+  function ensureOption(sel, val) {
+    if (val === '' || val == null) return;
+    var exists = Array.prototype.some.call(sel.options, function (o) { return o.value === String(val); });
+    if (!exists) sel.append(el('option', { value: val }, val));
+  }
+
   function applyTone(sel, c) {
     var o = opts(c).filter(function (o) { return o.value === sel.value; })[0];
     if (o && o.tone) sel.setAttribute('data-tone', o.tone); else sel.removeAttribute('data-tone');
+  }
+
+  // Update one row's cells in place after someone else's edit, leaving the focused cell alone.
+  function patchRow(kind, id) {
+    var tr = $('#table-' + kind + ' tbody tr[data-id="' + id + '"]');
+    var row = findRow(kind, id);
+    if (!tr || !row) return;
+    cols(kind).forEach(function (c) {
+      if (c.type === 'computed') return;
+      var f = $('[data-key="' + c.key + '"]', tr);
+      if (!f || f === document.activeElement) return;
+      var v = row[c.key] == null ? '' : String(row[c.key]);
+      if (f.value === v) return;
+      if (c.type === 'select') { ensureOption(f, v); f.value = v; applyTone(f, c); }
+      else { f.value = v; if (f.tagName === 'TEXTAREA') autosize(f); }
+    });
   }
 
   function refreshComputed(kind) {
@@ -284,9 +672,8 @@
     });
   }
 
-  function findRow(kind, id) { return state[kind].filter(function (r) { return r.id === id; })[0]; }
-
   function onCellInput(kind, e) {
+    if (readOnly) return;
     var t = e.target, key = t.dataset.key;
     if (!key) return;
     var row = findRow(kind, t.closest('tr').dataset.id);
@@ -294,44 +681,46 @@
     if (!row || !c) return;
     var v = t.value;
     if (NUMERIC.indexOf(c.type) >= 0) { var n = num(v); v = n == null ? '' : n; }
-    row[key] = v;
     if (c.type === 'select') applyTone(t, c);
     if (t.tagName === 'TEXTAREA') autosize(t);
+    commitField(kind, row, key, v);
     refreshComputed(kind);
     renderSummary(kind);
-    scheduleSave();
   }
 
   function addRow(kind) {
+    if (readOnly) return;
     var row = { id: uid() };
-    state[kind].push(row);
     views[kind].filter = '';
     $('[data-filter="' + kind + '"]').value = '';
+    createRows(kind, [row]);
     renderTable(kind);
-    scheduleSave();
     var tr = $('#table-' + kind + ' tr[data-id="' + row.id + '"]');
     if (tr) { tr.scrollIntoView({ block: 'nearest' }); var f = $('input,select,textarea', tr); if (f) f.focus(); }
   }
 
   function deleteRow(kind, id) {
     var row = findRow(kind, id);
-    if (!row) return;
+    if (!row || readOnly) return;
     var name = row[cols(kind)[0].key] || 'this ' + LABELS[kind].one;
-    if (!confirm('Delete “' + name + '”? This cannot be undone.')) return;
-    state[kind] = state[kind].filter(function (r) { return r.id !== id; });
-    renderTable(kind);
-    save();
+    askConfirm('Delete ' + LABELS[kind].one + '?', '“' + name + '” will be removed' + (mode === 'shared' ? ' for everyone' : '') + '. This cannot be undone.', 'Delete', true)
+      .then(function (ok) {
+        if (!ok) return;
+        removeRow(kind, id);
+        renderTable(kind);
+        toast('Deleted ' + name);
+      });
   }
 
   function duplicateRow(kind, id) {
-    var i = state[kind].findIndex(function (r) { return r.id === id; });
-    if (i < 0) return;
-    var copy = Object.assign({}, state[kind][i], { id: uid() });
+    var src = findRow(kind, id);
+    if (!src || readOnly) return;
+    var copy = Object.assign({}, src, { id: uid(), _created: (src._created || Date.now()) + 0.5 });
+    delete copy._by; delete copy._at;
     var k = cols(kind)[0].key;
     if (copy[k]) copy[k] = copy[k] + ' (copy)';
-    state[kind].splice(i + 1, 0, copy);
+    createRows(kind, [copy]);
     renderTable(kind);
-    save();
   }
 
   function updateCounts() {
@@ -426,6 +815,16 @@
 
   /* ---------------- import / export ---------------- */
   function download(name, text, type) {
+    if (inViewer) {
+      if (!downloadsNs) { toast('Saving files is not available in this view.'); return; }
+      downloadsNs.save({ filename: name, data: text })
+        .then(function () { toast('Saved ' + name); })
+        .catch(function (e) {
+          if (e && e.code === 'declined') return;
+          toast(e && e.code === 'rate_limited' ? 'A save prompt is already open.' : 'Could not save the file (' + ((e && e.code) || 'error') + ').');
+        });
+      return;
+    }
     var url = URL.createObjectURL(new Blob([text], { type: type }));
     var a = el('a', { href: url, download: name });
     document.body.append(a); a.click(); a.remove();
@@ -491,35 +890,36 @@
 
   function importCSV(kind, text) {
     var rows = parseCSV(text);
-    if (rows.length < 2) { alert('That CSV has no data rows.'); return; }
+    if (rows.length < 2) { toast('That CSV has no data rows.'); return; }
     var map = rows[0].map(function (h) {
       var n = normHeader(h);
       return cols(kind).filter(function (c) { return c.type !== 'computed' && (normHeader(c.label) === n || normHeader(c.key) === n); })[0] || null;
     });
-    if (!map.some(Boolean)) { alert('None of the CSV column headers matched this table. Use Export CSV to get a template with the expected headers.'); return; }
-    var added = 0;
-    rows.slice(1).forEach(function (r) {
+    if (!map.some(Boolean)) { toast('None of the CSV headers match this table. Use Export CSV to get a template with the expected headers.', 6000); return; }
+    var newRows = rows.slice(1).map(function (r) {
       var row = { id: uid() };
       map.forEach(function (c, i) { if (c && r[i] != null) row[c.key] = coerce(c, r[i]); });
-      state[kind].push(row); added++;
+      return row;
     });
+    createRows(kind, newRows).then(function () { renderTableKeepFocus(kind); });
     renderTable(kind);
-    save();
-    var skipped = rows[0].filter(function (h, i) { return !map[i]; });
-    alert('Imported ' + added + ' row(s).' + (skipped.length ? '\nIgnored columns: ' + skipped.join(', ') : ''));
+    var skipped = rows[0].filter(function (h, i) { return !map[i] && String(h).trim(); });
+    toast('Imported ' + newRows.length + ' row(s).' + (skipped.length ? ' Ignored columns: ' + skipped.join(', ') : ''), 6000);
   }
 
   function exportJSON() {
-    download('org-assessment-' + stamp() + '.json', JSON.stringify(state, null, 2), 'application/json');
+    var out = { version: 1, exportedAt: new Date().toISOString(), answers: state.answers, clients: state.clients, team: state.team };
+    download('org-assessment-' + stamp() + '.json', JSON.stringify(out, null, 2), 'application/json');
   }
 
   function importJSON(text) {
     var parsed;
-    try { parsed = JSON.parse(text); } catch (e) { alert('That file is not valid JSON.'); return; }
-    if (!confirm('Replace ALL current data (answers, clients and team) with this backup?')) return;
-    state = normalize(parsed);
-    save();
-    renderAll();
+    try { parsed = JSON.parse(text); } catch (e) { toast('That file is not valid JSON.'); return; }
+    var ns = normalize(parsed);
+    askConfirm('Replace all data?',
+      'This replaces every answer, client and team row' + (mode === 'shared' ? ' for everyone' : '') + ' with the backup (' + ns.clients.length + ' clients, ' + ns.team.length + ' people). Export a backup first if you might need the current data.',
+      'Replace', true)
+      .then(function (ok) { if (ok) replaceAll(ns); });
   }
 
   function pickFile(kind, accept) {
@@ -535,21 +935,21 @@
     renderQuestions();
     KINDS.forEach(renderTable);
     refreshDatalists();
+    applyReadOnly();
     route();
   }
 
   function bind() {
     window.addEventListener('hashchange', route);
-    window.addEventListener('beforeunload', function () { if (saveTimer) save(); });
+    window.addEventListener('beforeunload', function () { if (mode === 'local' && saveTimer) saveLocal(); if (mode === 'shared') flush(); });
+    document.addEventListener('visibilitychange', function () { if (document.hidden && mode === 'shared') flush(); });
 
-    // Questions
     $('#questions').addEventListener('input', function (e) {
       var t = e.target;
-      if (!t.dataset.qid) return;
-      state.answers[t.dataset.qid] = t.value;
+      if (!t.dataset.qid || readOnly) return;
       t.closest('.q').classList.toggle('answered', !!t.value.trim());
+      commitAnswer(t.dataset.qid, t.value);
       updateProgress();
-      scheduleSave();
     });
 
     KINDS.forEach(function (kind) {
@@ -568,7 +968,7 @@
         var v = views[kind], key = th.dataset.key;
         if (v.sort !== key) { v.sort = key; v.dir = 1; }
         else if (v.dir === 1) v.dir = -1;
-        else { v.sort = null; v.dir = 1; }   // third click clears sort
+        else { v.sort = null; v.dir = 1; }
         renderTable(kind);
       });
       $('[data-filter="' + kind + '"]').addEventListener('input', function (e) {
@@ -577,26 +977,27 @@
       });
     });
 
-    // Buttons with data-action (toolbar + menu)
     document.addEventListener('click', function (e) {
       var menu = $('#dataMenu');
       if (e.target.closest('#dataMenuBtn')) { menu.hidden = !menu.hidden; return; }
       if (!e.target.closest('.menu')) menu.hidden = true;
 
       var b = e.target.closest('button[data-action]');
-      if (!b || b.closest('tbody')) return;
+      if (!b || b.closest('tbody') || b.closest('.modal')) return;
       var kind = b.dataset.kind;
       menu.hidden = true;
       switch (b.dataset.action) {
         case 'add-row': addRow(kind); break;
         case 'export-csv': exportCSV(kind); break;
-        case 'import-csv': pickFile(kind, '.csv,text/csv'); break;
+        case 'import-csv': if (!readOnly) pickFile(kind, '.csv,text/csv'); break;
         case 'export-json': exportJSON(); break;
         case 'import-json': pickFile('json', '.json,application/json'); break;
         case 'reset':
-          if (confirm('Delete ALL answers, clients and team data stored in this browser? Export a backup first if you need it.')) {
-            state = emptyState(); save(); renderAll();
-          }
+          askConfirm('Clear all data?',
+            mode === 'shared' ? 'This deletes every answer, client and team row for everyone using this assessment. Export a backup first if you might need it.'
+              : 'This deletes all answers, clients and team data stored in this browser. Export a backup first if you might need it.',
+            'Clear everything', true)
+            .then(function (ok) { if (ok) replaceAll(emptyState()); });
           break;
       }
     });
@@ -606,20 +1007,54 @@
       var file = e.target.files[0];
       if (!file) return;
       var target = pendingImport;
-      file.text().then(function (text) {
-        if (target === 'json') importJSON(text); else importCSV(target, text);
+      var reader = new FileReader();
+      reader.onload = function () { if (target === 'json') importJSON(String(reader.result)); else importCSV(target, String(reader.result)); };
+      reader.onerror = function () { toast('Could not read that file.'); };
+      reader.readAsText(file);
+    });
+  }
+
+  function setIntro(text) { var p = $('#questionsIntro'); if (p) p.textContent = text; }
+
+  function startLocal(notice) {
+    mode = 'local';
+    loaded = { clients: true, team: true, answers: true };
+    if (notice) banner(notice, 'warn', 'mode');
+    setIntro('Answers save automatically in this browser only. Use Data → Export to back them up or share them.');
+    return loadLocal().then(function () {
+      renderAll();
+      updateMenu();
+      setStatus(state.updatedAt ? 'Last saved ' + new Date(state.updatedAt).toLocaleString() + ' · this browser only' : 'Saved in this browser only');
+    });
+  }
+
+  function startShared() {
+    mode = 'shared';
+    setStatus('Connecting…');
+    setIntro('Everyone with access to this page sees and edits the same answers. Changes save automatically.');
+    renderAll();
+    Promise.all([window.claude.use('db'), window.claude.use('user'), window.claude.use('downloads')]).then(function (r) {
+      db = r[0]; userNs = r[1]; downloadsNs = r[2];
+      if (!db) return startLocal('Shared data is not available in this view (you may be signed out, or lack access). Anything you type stays in this browser only.');
+      var facts = userNs ? Promise.all([userNs.id(), userNs.can('data.write'), userNs.canEdit()]) : Promise.resolve([null, null, false]);
+      return facts.then(function (u) {
+        meId = u[0];
+        isAdmin = !!u[2];
+        if (u[1] === false) setReadOnly(true, 'You have view-only access. Ask the owner to give you Contributor access to add or edit data.');
+        updateMenu();
+        subscribe();
       });
+    }).catch(function () {
+      startLocal('Could not connect to the shared data. Anything you type stays in this browser only.');
     });
   }
 
   function init() {
     document.title = C.appTitle || document.title;
     $('#appTitle').textContent = C.appTitle || 'Org Assessment';
-    load().then(function () {
-      renderAll();
-      bind();
-      setStatus(state.updatedAt ? 'Last saved ' + new Date(state.updatedAt).toLocaleString() : 'Saved locally in this browser');
-    });
+    buildChrome();
+    bind();
+    if (inViewer) startShared(); else startLocal();
   }
 
   init();
