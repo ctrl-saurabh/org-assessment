@@ -11,14 +11,18 @@ window.APP_CONFIG = {
   appTitle: 'Circulants · Org Assessment',
   storageKey: 'circulants-org-assessment-v1',
   currency: 'USD',
-  locale: undefined, // e.g. 'en-IN' or 'en-US'; undefined = browser default
+  locale: 'en-US', // e.g. 'en-IN' or 'en-US'; undefined = browser default
 
   questions: [
     // Strategy & business
     { id: 'priorities', section: 'Strategy & business', text: 'What are the organization’s top 3 priorities for the next 12 months?' },
-    { id: 'revenue_mix', section: 'Strategy & business', text: 'Which clients or segments drive most of the revenue and margin? Where is the concentration risk?' },
+    { id: 'revenue_mix', section: 'Strategy & business', text: 'Which clients drive most of the revenue and margin? Where is the concentration risk?' },
     { id: 'pipeline', section: 'Strategy & business', text: 'What does the sales pipeline look like for the next two quarters?', hint: 'Named deals, stage, expected value, confidence.' },
     { id: 'positioning', section: 'Strategy & business', text: 'How do we differentiate from competitors? Why do clients choose us?' },
+    
+    //Client relationships
+    { id: 'client_relationships', section: 'Client relationships', text: 'How is client relationship managed post the initial sales cycle?' },
+    { id: 'client_relationships', section: 'Client relationships', text: 'What % of revenue is from repeat business/ account growth' },
 
     // Delivery
     { id: 'delivery_quality', section: 'Delivery', text: 'How is delivery quality measured today?', hint: 'Metrics, reviews, CSAT, delivery governance.' },
@@ -35,10 +39,10 @@ window.APP_CONFIG = {
     { id: 'ai_adoption', section: 'People & talent', text: 'How are teams using AI in delivery today? What is blocking wider adoption?' },
 
     // Operations & finance
-    { id: 'pricing', section: 'Operations & finance', text: 'How is pricing set? What are the rate cards and margin targets?' },
-    { id: 'systems', section: 'Operations & finance', text: 'Which tools and systems run the business?', hint: 'PSA / time tracking, HR, finance, CRM, project management.' },
-    { id: 'reporting', section: 'Operations & finance', text: 'Which reports does leadership receive, and how often? Which decisions do they support?' },
-    { id: 'cash', section: 'Operations & finance', text: 'Are there any cash flow, invoicing or collections issues?' },
+   // { id: 'pricing', section: 'Operations & finance', text: 'How is pricing set? What are the rate cards and margin targets?' },
+   // { id: 'systems', section: 'Operations & finance', text: 'Which tools and systems run the business?', hint: 'PSA / time tracking, HR, finance, CRM, project management.' },
+   // { id: 'reporting', section: 'Operations & finance', text: 'Which reports does leadership receive, and how often? Which decisions do they support?' },
+   // { id: 'cash', section: 'Operations & finance', text: 'Are there any cash flow, invoicing or collections issues?' },
 
     // Wrap-up
     { id: 'protect', section: 'Wrap-up', text: 'What is working well that we must protect?' },
