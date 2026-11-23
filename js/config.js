@@ -15,18 +15,20 @@ window.APP_CONFIG = {
 
   questions: [
     // Strategy & business
-    { id: 'priorities', section: 'Strategy & business', text: 'What are the organization’s top 3 priorities for the next 12 months?' },
+    { id: 'priorities', section: 'Strategy & business', text: 'What are the organization’s top 3 priorities/OKRs for the next 12 months?' },
+    { id: 'strategy', section: 'Strategy & business', text: 'What are the top 3 things to fix in the first 90 days?' },
     { id: 'revenue_mix', section: 'Strategy & business', text: 'Which clients drive most of the revenue and margin? Where is the concentration risk?' },
     { id: 'pipeline', section: 'Strategy & business', text: 'What does the sales pipeline look like for the next two quarters?', hint: 'Named deals, stage, expected value, confidence.' },
     { id: 'positioning', section: 'Strategy & business', text: 'How do we differentiate from competitors? Why do clients choose us?' },
     
     //Client relationships
-    { id: 'client_relationships', section: 'Client relationships', text: 'How is client relationship managed post the initial sales cycle?' },
-    { id: 'client_relationships', section: 'Client relationships', text: 'What % of revenue is from repeat business/ account growth' },
+    { id: 'client_relationships', section: 'Client relationships', text: 'How is client relationship managed post the initial sales cycle? Who manages this?' },
+    { id: 'recurring_revenue', section: 'Client relationships', text: 'What % of revenue is from repeat business/ account growth' },
+    { id: 'client_churn', section: 'Client relationships', text: 'what is the client churn rate over the last 12 months?', hint: 'CSAT, NPS, quarterly business reviews, etc.' },
 
     // Delivery
     { id: 'delivery_quality', section: 'Delivery', text: 'How is delivery quality measured today?', hint: 'Metrics, reviews, CSAT, delivery governance.' },
-    { id: 'delivery_issues', section: 'Delivery', text: 'What are the biggest recurring delivery problems?' },
+    { id: 'delivery_issues', section: 'Delivery', text: 'What are the top 2-3 recurring delivery problems?', hint : 'Missed deadlines, quality issues, scope creep, resourcing gaps, etc.' },
     { id: 'at_risk', section: 'Delivery', text: 'Which projects or accounts are currently at risk, and why?' },
     { id: 'governance', section: 'Delivery', text: 'What governance cadences exist?', hint: 'Weekly status, monthly reviews, QBRs, steering committees.' },
 
@@ -45,8 +47,8 @@ window.APP_CONFIG = {
    // { id: 'cash', section: 'Operations & finance', text: 'Are there any cash flow, invoicing or collections issues?' },
 
     // Wrap-up
-    { id: 'protect', section: 'Wrap-up', text: 'What is working well that we must protect?' },
-    { id: 'first_90', section: 'Wrap-up', text: 'What are the top 3 things to fix in the first 90 days?' },
+   // { id: 'protect', section: 'Wrap-up', text: 'What is working well that we must protect?' },
+   // { id: 'first_90', section: 'Wrap-up', text: 'What are the top 3 things to fix in the first 90 days?' },
     { id: 'other', section: 'Wrap-up', text: 'Other observations' }
   ],
 
