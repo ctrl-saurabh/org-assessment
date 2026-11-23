@@ -1,0 +1,31 @@
+rules_version = '2';
+
+// Who can read and write the assessment data.
+// Paste this into Firebase console → Firestore Database → Rules, edit the two lists, then Publish.
+// The website is public; these rules are what keep the data private.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function allowed() {
+      return signedIn() && (
+        // 1) Individual people (lower-case emails)
+        request.auth.token.email.lower() in [
+          'someone@example.com'
+        ]
+        // 2) Everyone on your company's Google Workspace domain — change example.com, or delete this line
+        || request.auth.token.email.lower().matches('.*@example[.]com$')
+      );
+    }
+
+    match /clients/{id} { allow read, write: if allowed(); }
+    match /team/{id}    { allow read, write: if allowed(); }
+    match /answers/{id} { allow read, write: if allowed(); }
+
+    // Everything else is closed.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

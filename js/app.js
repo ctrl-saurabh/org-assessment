@@ -17,8 +17,11 @@
   var ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
   var inViewer = !!(window.claude && typeof window.claude.use === 'function');
+  var FB = C.firebase || {};
+  var fbConfigured = !!(FB.config && FB.config.apiKey && FB.config.projectId);
   var mode = 'local';
-  var db = null, userNs = null, downloadsNs = null, meId = null;
+  var backend = null;                        // 'firebase' | 'artifact' (when mode === 'shared')
+  var db = null, userNs = null, downloadsNs = null, meId = null, meName = null, fbAuth = null;
   var readOnly = false, isAdmin = true;
 
   var state = emptyState();
@@ -214,11 +217,21 @@
     queueWrite('answers', qid, { text: text });
   }
 
+  // Who/when stamp on every shared write. Firebase has no profile lookup, so it also stores the name.
+  function authorMeta() {
+    var m = { _by: meId, _at: Date.now() };
+    if (backend === 'firebase') m._byName = meName || null;
+    return m;
+  }
+
+  function errCode(e) {
+    return String((e && e.code) || '').replace(/^firestore\//, '').replace(/-/g, '_');
+  }
+
   function docBody(row) {
     var b = Object.assign({}, row);
     delete b.id;
-    b._by = meId; b._at = Date.now();
-    return b;
+    return Object.assign(b, authorMeta());
   }
 
   function createRows(kind, rows) {
@@ -256,7 +269,7 @@
     var creates = [];
     KINDS.forEach(function (k) { ns[k].forEach(function (r) { creates.push(function () { return db.collection(k).doc(r.id).set(docBody(r)); }); }); });
     Object.keys(ns.answers).forEach(function (q) {
-      if (String(ns.answers[q]).trim()) creates.push(function () { return db.collection('answers').doc(q).set({ text: ns.answers[q], _by: meId, _at: Date.now() }); });
+      if (String(ns.answers[q]).trim()) creates.push(function () { return db.collection('answers').doc(q).set(Object.assign({ text: ns.answers[q] }, authorMeta())); });
     });
     return runLimited(dels, 5)
       .then(function () { return runLimited(creates, 5); })
@@ -288,14 +301,14 @@
     activeWrites++;
     var key = kind + '/' + id;
     var ref = db.collection(kind).doc(id);
-    var meta = { _by: meId, _at: Date.now() };
+    var meta = authorMeta();
     var before = creating[key] || Promise.resolve();
     before.then(function () {
       return kind === 'answers' ? ref.set(Object.assign({}, fields, meta)) : ref.update(Object.assign({}, fields, meta));
     }).then(function () {
       delete retries[key];
     }, function (e) {
-      if (e && e.code === 'unavailable' && (retries[key] || 0) < 3) {
+      if (errCode(e) === 'unavailable' && (retries[key] || 0) < 3) {
         retries[key] = (retries[key] || 0) + 1;
         pending[kind][id] = Object.assign({}, fields, pending[kind][id] || {});
         setTimeout(flush, 1000 + Math.random() * 1500);
@@ -323,15 +336,19 @@
   }
 
   function handleWriteError(e, kind, id) {
-    var code = e && e.code;
-    if (code === 'invalid_argument' || code === 'transform_error') {
+    var code = errCode(e);
+    if (code === 'not_found') return; // updated a row someone else deleted (Firestore)
+    if (code === 'invalid_argument' || code === 'transform_error' || code === 'permission_denied' || code === 'unauthenticated') {
       if (kind && kind !== 'answers' && id && !findRow(kind, id)) return; // someone else deleted that row
-      setReadOnly(true, 'Your changes could not be saved because you have view-only access. Ask the owner to give you Contributor access.');
+      setReadOnly(true, backend === 'firebase'
+        ? 'Your changes could not be saved because your account does not have write access. Ask the admin to add your email to the Firestore rules.'
+        : 'Your changes could not be saved because you have view-only access. Ask the owner to give you Contributor access.');
     } else if (code === 'quota_exceeded') {
       banner('The shared store is full (' + (e.message || 'quota reached') + '). Delete unused rows to make room.', 'bad', 'quota');
     } else if (code === 'revoked') {
       setReadOnly(true, 'Your access to this shared data was withdrawn.');
     } else if (code === 'resource_exhausted') {
+      if (backend === 'firebase') { banner('The Firebase free-tier quota is used up for today, so changes are not being saved. Try again tomorrow or upgrade the Firebase plan.', 'bad', 'quota'); updateSaveStatus(); return; }
       banner('Too many changes at once. Wait a few seconds, then make your last edit again.', 'warn', 'rate');
     } else {
       banner('A change could not be saved (' + (code || 'unknown error') + '). Check your connection and make the edit again.', 'warn', 'save');
@@ -377,8 +394,13 @@
     function listen(k, apply, attempt) {
       db.collection(k).onSnapshot(function (snap) { apply(snap); markLoaded(k, snap); }, function (e) {
         clearTimeout(timer);
-        if (e && e.code === 'revoked') return setReadOnly(true, 'Your access to this shared data was withdrawn.');
-        if (e && e.code === 'unavailable' && attempt < 2) return setTimeout(function () { listen(k, apply, attempt + 1); }, 3000);
+        var code = errCode(e);
+        if (code === 'revoked') return setReadOnly(true, 'Your access to this shared data was withdrawn.');
+        if (code === 'permission_denied' || code === 'unauthenticated') {
+          banner(null, null, 'conn');
+          return setReadOnly(true, 'Your account (' + (meName || 'this account') + ') does not have access to this assessment. Ask the admin to add your email, or sign out and use another account.');
+        }
+        if (code === 'unavailable' && attempt < 2) return setTimeout(function () { listen(k, apply, attempt + 1); }, 3000);
         banner('Lost the live connection to the shared data. Reopen the page to reconnect.', 'bad', 'conn');
       });
     }
@@ -417,7 +439,7 @@
       var data = d.data() || {};
       var local = pending.answers[d.id] || sending.answers[d.id];
       state.answers[d.id] = local ? local.text : String(data.text == null ? '' : data.text);
-      answerMeta[d.id] = { by: data._by || null, at: data._at || null };
+      answerMeta[d.id] = { by: data._by || null, at: data._at || null, name: data._byName || '' };
     });
     Object.keys(state.answers).forEach(function (k) {
       if (!ids[k] && !pending.answers[k] && !sending.answers[k]) { delete state.answers[k]; delete answerMeta[k]; }
@@ -434,12 +456,14 @@
   function renderAnswerMeta() {
     if (mode !== 'shared') return;
     var ids = uniq(Object.keys(answerMeta).map(function (k) { return answerMeta[k].by; }));
-    var resolve = userNs && ids.length ? userNs.profiles(ids) : Promise.resolve({});
+    var resolve = backend === 'artifact' && userNs && ids.length ? userNs.profiles(ids) : Promise.resolve({});
     resolve.then(function (ps) {
       $$('#questions [data-meta-for]').forEach(function (p) {
         var m = answerMeta[p.dataset.metaFor];
         if (!m || !m.at || !(state.answers[p.dataset.metaFor] || '').trim()) { p.textContent = ''; return; }
-        var who = m.by && ps[m.by] ? (ps[m.by].isMe ? 'you' : (ps[m.by].name || 'someone')) : 'someone';
+        var who = m.by && m.by === meId ? 'you'
+          : backend === 'firebase' ? (m.name || 'someone')
+          : m.by && ps[m.by] ? (ps[m.by].name || 'someone') : 'someone';
         p.textContent = 'Last edited by ' + who + ' · ' + fmtWhen(m.at);
       });
     });
@@ -1020,8 +1044,109 @@
     });
   }
 
+  /* ---------------- Firebase backend (GitHub Pages) ---------------- */
+
+  // Wraps Firestore (compat SDK) in the same small surface the shared-mode code uses.
+  function firestoreAdapter(fs) {
+    return {
+      collection: function (name) {
+        var c = fs.collection(name);
+        return {
+          doc: function (id) {
+            var d = c.doc(id);
+            return {
+              set: function (x) { return d.set(x); },
+              update: function (x) { return d.update(x); },
+              delete: function () { return d.delete(); }
+            };
+          },
+          onSnapshot: function (next, err) { return c.onSnapshot({ includeMetadataChanges: true }, next, err); }
+        };
+      }
+    };
+  }
+
+  function showSignIn(message) {
+    var gate = $('#signin');
+    if (!gate) {
+      gate = el('div', { id: 'signin', class: 'modal-backdrop signin' }, el('div', { class: 'modal' }, [
+        el('h2', null, 'Sign in to continue'),
+        el('p', { id: 'signinMsg' }),
+        el('div', { class: 'modal-actions' }, el('button', { class: 'btn primary', id: 'signinBtn' }, 'Sign in with Google'))
+      ]));
+      document.body.append(gate);
+      $('#signinBtn').addEventListener('click', signIn);
+    }
+    $('#signinMsg').textContent = message || 'This assessment holds confidential client and team data. Sign in with your work Google account to view and edit it.';
+    gate.hidden = false;
+  }
+
+  function signIn() {
+    var provider = new firebase.auth.GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    fbAuth.signInWithPopup(provider).catch(function (e) {
+      var code = String(e && e.code || '');
+      if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') return fbAuth.signInWithRedirect(provider);
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
+      if (code === 'auth/unauthorized-domain') return showSignIn('Sign-in is not enabled for ' + location.hostname + '. The admin needs to add it under Firebase → Authentication → Settings → Authorized domains.');
+      showSignIn('Sign-in failed (' + (code || 'unknown error') + '). Try again.');
+    });
+  }
+
+  function showUserChip(email) {
+    var host = $('.topbar-actions');
+    var chip = $('#userChip');
+    if (!chip) {
+      chip = el('div', { id: 'userChip', class: 'user-chip' }, [
+        el('span', { id: 'userEmail' }),
+        el('button', { class: 'btn', id: 'signOutBtn' }, 'Sign out')
+      ]);
+      host.insertBefore(chip, $('.menu', host));
+      $('#signOutBtn').addEventListener('click', function () {
+        flush();
+        fbAuth.signOut().then(function () { location.reload(); });
+      });
+    }
+    $('#userEmail').textContent = email;
+  }
+
+  function startFirebase() {
+    mode = 'shared';
+    backend = 'firebase';
+    isAdmin = false;
+    updateMenu();
+    setStatus('Signing in…');
+    setIntro('Everyone signed in to this assessment sees and edits the same answers. Changes save automatically.');
+    renderAll();
+    try {
+      if (!firebase.apps.length) firebase.initializeApp(FB.config);
+      fbAuth = firebase.auth();
+      db = firestoreAdapter(firebase.firestore());
+    } catch (e) {
+      return startLocal('Could not start Firebase (' + (e && e.message || 'configuration error') + '). Check the firebase settings in js/config.js. Anything you type stays in this browser only.');
+    }
+    fbAuth.getRedirectResult().catch(function (e) { showSignIn('Sign-in failed (' + ((e && e.code) || 'unknown error') + '). Try again.'); });
+    var started = false;
+    fbAuth.onAuthStateChanged(function (u) {
+      if (!u) { setStatus('Signed out'); showSignIn(); return; }
+      var gate = $('#signin'); if (gate) gate.hidden = true;
+      if (started) return;
+      started = true;
+      meId = u.uid;
+      meName = u.displayName || u.email || '';
+      var email = String(u.email || '').toLowerCase();
+      isAdmin = (FB.admins || []).some(function (a) { return String(a).toLowerCase() === email; });
+      showUserChip(u.email || meName);
+      setStatus('Connecting…');
+      updateMenu();
+      subscribe();
+    });
+  }
+
+  /* ---------------- claude.ai Artifact backend ---------------- */
   function startShared() {
     mode = 'shared';
+    backend = 'artifact';
     setStatus('Connecting…');
     setIntro('Everyone with access to this page sees and edits the same answers. Changes save automatically.');
     renderAll();
@@ -1046,7 +1171,10 @@
     $('#appTitle').textContent = C.appTitle || 'Org Assessment';
     buildChrome();
     bind();
-    if (inViewer) startShared(); else startLocal();
+    if (inViewer) startShared();
+    else if (fbConfigured && window.firebase) startFirebase();
+    else if (fbConfigured) startLocal('Could not load Firebase (check your internet connection or ad blocker). Anything you type stays in this browser only.');
+    else startLocal();
   }
 
   init();

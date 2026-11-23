@@ -13,6 +13,24 @@ window.APP_CONFIG = {
   currency: 'USD',
   locale: 'en-US', // e.g. 'en-IN' or 'en-US'; undefined = browser default
 
+  /*
+   * Shared storage (Firebase Firestore + Google sign-in). See README → "Set up Firebase".
+   * Paste the values from Firebase console → Project settings → Your apps → Web app.
+   * These values are not secret; access is controlled by firestore.rules.
+   * While apiKey is empty, the site keeps data in each person's browser only.
+   */
+  firebase: {
+    config: {
+      apiKey: '',
+      authDomain: '',
+      projectId: '',
+      appId: ''
+    },
+    // Emails that see "Import JSON backup" and "Clear all shared data". This only hides
+    // the menu items; who can read and write at all is set in firestore.rules.
+    admins: []
+  },
+
   questions: [
     // Strategy & business
     { id: 'priorities', section: 'Strategy & business', text: 'What are the organization’s top 3 priorities/OKRs for the next 12 months?' },
