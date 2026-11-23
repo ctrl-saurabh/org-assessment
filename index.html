@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Org Assessment</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◆</span><span id="appTitle">Org Assessment</span></div>
+    <nav class="tabs">
+      <a href="#questions" data-tab="questions">Questions</a>
+      <a href="#clients" data-tab="clients">Clients <span class="count" id="count-clients"></span></a>
+      <a href="#team" data-tab="team">Team <span class="count" id="count-team"></span></a>
+    </nav>
+    <div class="topbar-actions">
+      <span id="saveStatus" class="save-status"></span>
+      <div class="menu">
+        <button class="btn" id="dataMenuBtn" aria-haspopup="true">Data ▾</button>
+        <div class="menu-list" id="dataMenu" hidden>
+          <button data-action="export-json">Export everything (JSON backup)</button>
+          <button data-action="import-json">Import JSON backup…</button>
+          <hr>
+          <button data-action="reset" class="danger">Clear all data…</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Questions (start page) -->
+    <section id="view-questions" class="view">
+      <div class="page-head">
+        <div>
+          <h1>Current state assessment</h1>
+          <p class="sub">Answers save automatically in this browser. Use <strong>Data → Export</strong> to back them up or share them.</p>
+        </div>
+        <div class="progress">
+          <div class="progress-bar"><span id="progressFill"></span></div>
+          <span id="progressText"></span>
+        </div>
+      </div>
+      <div id="questions"></div>
+    </section>
+
+    <!-- Clients -->
+    <section id="view-clients" class="view" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Active clients</h1>
+          <p class="sub">Click any cell to edit. Click a column header to sort.</p>
+        </div>
+      </div>
+      <div class="summary" id="summary-clients"></div>
+      <div class="toolbar">
+        <input type="search" class="search" data-filter="clients" placeholder="Filter clients…">
+        <span class="spacer"></span>
+        <button class="btn" data-action="import-csv" data-kind="clients">Import CSV</button>
+        <button class="btn" data-action="export-csv" data-kind="clients">Export CSV</button>
+        <button class="btn primary" data-action="add-row" data-kind="clients">+ Add client</button>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="table-clients"><thead></thead><tbody></tbody></table>
+        <p class="empty" id="empty-clients" hidden></p>
+      </div>
+    </section>
+
+    <!-- Team -->
+    <section id="view-team" class="view" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Team members</h1>
+          <p class="sub">Click any cell to edit. Click a column header to sort.</p>
+        </div>
+      </div>
+      <div class="summary" id="summary-team"></div>
+      <div class="toolbar">
+        <input type="search" class="search" data-filter="team" placeholder="Filter team…">
+        <span class="spacer"></span>
+        <button class="btn" data-action="import-csv" data-kind="team">Import CSV</button>
+        <button class="btn" data-action="export-csv" data-kind="team">Export CSV</button>
+        <button class="btn primary" data-action="add-row" data-kind="team">+ Add person</button>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="table-team"><thead></thead><tbody></tbody></table>
+        <p class="empty" id="empty-team" hidden></p>
+      </div>
+    </section>
+  </main>
+
+  <input type="file" id="fileInput" hidden>
+  <div id="datalists" hidden></div>
+
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
