@@ -15,7 +15,7 @@ service cloud.firestore {
 
     match /spaces/{code}/{collection}/{id} {
       allow read, write: if code == 'REPLACE_WITH_ACCESS_CODE'
-                         && collection in ['clients', 'team', 'answers'];
+                         && collection in ['clients', 'team', 'answers', 'comments'];
     }
 
     // Everything else is closed.

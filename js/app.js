@@ -30,6 +30,7 @@
   var loaded = { clients: false, team: false, answers: false };
   var rendered = { clients: false, team: false };
   var saveTimer = null, pendingImport = null;
+  var commentsReady = false, commentsBlocked = false;
 
   // shared-mode write queue
   var pending = { clients: {}, team: {}, answers: {} };   // fields waiting to be sent
@@ -156,7 +157,7 @@
   function setStatus(t, err) { var s = $('#saveStatus'); s.textContent = t; s.classList.toggle('err', !!err); }
 
   /* ---------------- state shape ---------------- */
-  function emptyState() { return { version: 1, updatedAt: null, answers: {}, clients: [], team: [] }; }
+  function emptyState() { return { version: 1, updatedAt: null, answers: {}, clients: [], team: [], comments: [] }; }
 
   function normalize(s) {
     s = s || {};
@@ -174,6 +175,14 @@
         return row;
       }) : [];
     });
+    out.comments = Array.isArray(s.comments) ? s.comments.filter(function (c) {
+      return c && typeof c.text === 'string' && c.text.trim() && typeof c.section === 'string';
+    }).map(function (c, i) {
+      var x = Object.assign({}, c);
+      if (!x.id || !ID_RE.test(String(x.id))) x.id = uid();
+      if (!x._created) x._created = x._at || t0 + i;
+      return x;
+    }) : [];
     return out;
   }
 
@@ -266,13 +275,19 @@
     var dels = [];
     KINDS.forEach(function (k) { state[k].forEach(function (r) { dels.push(function () { return db.collection(k).doc(r.id).delete(); }); }); });
     Object.keys(state.answers).forEach(function (q) { dels.push(function () { return db.collection('answers').doc(q).delete(); }); });
+    var cdels = state.comments.map(function (c) { return function () { return db.collection('comments').doc(c.id).delete(); }; });
     var creates = [];
     KINDS.forEach(function (k) { ns[k].forEach(function (r) { creates.push(function () { return db.collection(k).doc(r.id).set(docBody(r)); }); }); });
+    // comments keep their original author and time
+    var ccreates = ns.comments.map(function (c) { var b = Object.assign({}, c); delete b.id; return function () { return db.collection('comments').doc(c.id).set(b); }; });
+    var commentErr = function (e) { if (errCode(e) === 'permission_denied') { commentsBlocked = true; return; } throw e; };
     Object.keys(ns.answers).forEach(function (q) {
       if (String(ns.answers[q]).trim()) creates.push(function () { return db.collection('answers').doc(q).set(Object.assign({ text: ns.answers[q] }, authorMeta())); });
     });
     return runLimited(dels, 5)
+      .then(function () { return runLimited(cdels, 5).catch(commentErr); })
       .then(function () { return runLimited(creates, 5); })
+      .then(function () { return commentsBlocked ? null : runLimited(ccreates, 5).catch(commentErr); })
       .then(function () { toast('Shared data replaced'); }, function (e) { handleWriteError(e); })
       .then(updateSaveStatus);
   }
@@ -406,6 +421,34 @@
     }
     KINDS.forEach(function (k) { listen(k, function (snap) { applyRows(k, snap); }, 0); });
     listen('answers', applyAnswers, 0);
+    listenComments(0);
+  }
+
+  // Comments have their own listener: if the Firestore rules don't allow them yet,
+  // only the comment threads are affected, not the rest of the site.
+  function listenComments(attempt) {
+    db.collection('comments').onSnapshot(function (snap) {
+      if (snap.metadata.fromCache && !commentsReady) return;
+      commentsReady = true;
+      commentsBlocked = false;
+      banner(null, null, 'comments');
+      applyComments(snap);
+    }, function (e) {
+      var code = errCode(e);
+      if (code === 'unavailable' && attempt < 2) return setTimeout(function () { listenComments(attempt + 1); }, 3000);
+      commentsBlocked = code === 'permission_denied' || code === 'unauthenticated';
+      banner(commentsBlocked ? 'Comments are switched off for now: the Firebase rules don’t include “comments” yet. Ask the assessment owner to update the rules (see README).'
+        : 'Lost the live connection to comments. Reopen the page to reconnect.', 'warn', 'comments');
+      renderCapComments();
+    });
+  }
+
+  function applyComments(snap) {
+    var seen = {};
+    var list = snap.docs.map(function (d) { seen[d.id] = 1; var c = Object.assign({}, d.data()); c.id = d.id; return c; });
+    state.comments.forEach(function (c) { if (!seen[c.id] && creating['comments/' + c.id]) list.push(c); });
+    state.comments = list;
+    renderCapComments();
   }
 
   function applyRows(kind, snap) {
@@ -472,7 +515,7 @@
   /* ---------------- routing ---------------- */
   function route() {
     var tab = (location.hash || '#questions').slice(1);
-    if (['questions', 'clients', 'team'].indexOf(tab) < 0) tab = 'questions';
+    if (['questions', 'clients', 'team', 'capability'].indexOf(tab) < 0) tab = 'questions';
     $$('.view').forEach(function (v) { v.hidden = v.id !== 'view-' + tab; });
     $$('.tabs a').forEach(function (a) { a.classList.toggle('active', a.dataset.tab === tab); });
     requestAnimationFrame(function () { $$('#view-' + tab + ' .grid textarea').forEach(autosize); });
@@ -829,6 +872,251 @@
     });
   }
 
+  /* ---------------- capability map + comments ---------------- */
+  var CM = window.CAPABILITY_MAP || null;
+  var cmFilter = 'all';
+
+  function sectionSel(id) { return '[data-section="' + String(id).replace(/["\\]/g, '\\$&') + '"]'; }
+
+  function commentToggle(id) {
+    return el('button', { class: 'cm-toggle', type: 'button', 'data-cm': 'toggle', 'data-section': id, 'aria-expanded': 'false' },
+      [el('span', { 'aria-hidden': 'true' }, '💬'), el('span', { class: 'cm-label' }, 'Comment')]);
+  }
+
+  function commentThread(id, areas) {
+    var form = el('form', { class: 'cm-form', 'data-section': id }, [
+      areas ? el('select', { class: 'cm-area', 'aria-label': 'What the comment is about' },
+        [el('option', { value: '' }, 'Whole section')].concat(areas.map(function (a) { return el('option', { value: a[0] }, a[0]); }))) : null,
+      el('textarea', { class: 'cm-text', rows: 2, placeholder: 'Add a comment…', 'aria-label': 'Comment' }),
+      el('button', { class: 'btn primary', type: 'submit' }, 'Post')
+    ]);
+    return el('div', { class: 'cm-thread', 'data-section': id, hidden: true }, [el('ul', { class: 'cm-list' }), form]);
+  }
+
+  function renderCapMap() {
+    var host = $('#capMap');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!CM) { host.append(el('p', { class: 'empty' }, 'The capability map data (js/capability-map.js) did not load.')); return; }
+
+    var scores = [];
+    CM.domains.forEach(function (d) { d.areas.forEach(function (a) { scores.push(a[1]); }); });
+    function cnt(f) { return scores.filter(f).length; }
+
+    host.append(
+      el('div', { class: 'page-head' }, el('div', null, [
+        el('div', { class: 'cm-eyebrow' }, CM.eyebrow),
+        el('h1', null, CM.title),
+        el('p', { class: 'sub cm-lede' }, CM.lede)
+      ])),
+      el('div', { class: 'cm-bar' }, [
+        el('div', { class: 'cm-legend', 'aria-label': 'Score legend' }, CM.legend.map(function (l) {
+          return el('div', { class: 'cm-key' }, [el('span', { class: 'cm-sw cm-l' + l[0] }, l[0]), l[1]]);
+        })),
+        el('div', { class: 'cm-filters', role: 'group', 'aria-label': 'Filter areas' }, [['all', 'All areas'], ['strong', 'Strengths (3–4)'], ['gap', 'Gaps (0–1)']].map(function (f) {
+          return el('button', { type: 'button', 'data-cm': 'filter', 'data-f': f[0], 'aria-pressed': String(cmFilter === f[0]) }, f[1]);
+        }))
+      ]),
+      el('div', { class: 'summary' }, [
+        card('Areas assessed', scores.length),
+        card('Strengths', cnt(function (s) { return s >= 3; }), 'score 3–4'),
+        card('Mentioned only', cnt(function (s) { return s === 2; }), 'score 2'),
+        card('Gaps', cnt(function (s) { return s <= 1; }), 'score 0–1'),
+        card('Comments', el('span', { id: 'cmTotal' }, '0'), 'across all sections')
+      ])
+    );
+
+    var map = el('div', { class: 'cm-map' });
+    CM.domains.forEach(function (d) {
+      var avg = d.areas.reduce(function (a, x) { return a + x[1]; }, 0) / d.areas.length;
+      var tiles = el('div', { class: 'cm-tiles' }, d.areas.map(function (a) {
+        return el('button', { type: 'button', class: 'cm-tile cm-l' + a[1], 'data-cm': 'tile', 'data-s': a[1], 'data-area': a[0],
+          title: 'Comment on ' + a[0], 'aria-label': a[0] + ': score ' + a[1] + ' of 4. ' + a[2] + '. Click to comment.' }, [
+          el('span', { class: 'cm-s' }, a[1]),
+          el('span', { class: 'cm-n' }, a[0]),
+          el('span', { class: 'cm-e' }, a[2]),
+          el('span', { class: 'cm-tc', hidden: true })
+        ]);
+      }));
+      var meter = el('div', { class: 'cm-meter', 'aria-hidden': 'true' }, el('i', { style: 'width:' + (avg / 4 * 100) + '%' }));
+      map.append(el('div', { class: 'cm-row', 'data-section': d.code }, [
+        el('div', { class: 'cm-dom' }, [
+          el('span', { class: 'cm-code' }, d.code), el('h2', null, d.name), meter,
+          el('small', null, 'avg ' + avg.toFixed(1) + ' / 4 · ' + d.areas.length + ' areas'),
+          commentToggle(d.code)
+        ]),
+        tiles,
+        commentThread(d.code, d.areas)
+      ]));
+    });
+    host.append(map);
+
+    host.append(el('div', { class: 'cm-notes' }, CM.notes.map(function (n) {
+      return el('section', { class: 'cm-note', 'data-section': n.id }, [
+        el('h2', null, n.title),
+        el('ul', null, n.items.map(function (t) { return el('li', null, t); })),
+        commentToggle(n.id),
+        commentThread(n.id, null)
+      ]);
+    })));
+    host.append(el('p', { class: 'cm-foot' }, CM.foot));
+
+    applyCapFilter();
+    renderCapComments();
+    applyReadOnly();
+  }
+
+  function applyCapFilter() {
+    $$('#capMap [data-cm="filter"]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.f === cmFilter)); });
+    $$('#capMap .cm-tile').forEach(function (t) {
+      var s = +t.dataset.s;
+      t.classList.toggle('dim', cmFilter === 'strong' ? s < 3 : cmFilter === 'gap' ? s > 1 : false);
+    });
+  }
+
+  function commentAuthor(c) {
+    if (mode === 'local' || (c._by && c._by === meId)) return 'You';
+    return c._byName || 'Someone';
+  }
+
+  function renderCapComments() {
+    if (!$('#capMap')) return;
+    var bySection = {};
+    var list = state.comments.slice().sort(function (a, b) { return (a._created || 0) - (b._created || 0); });
+    list.forEach(function (c) { (bySection[c.section] = bySection[c.section] || []).push(c); });
+
+    $$('#capMap .cm-thread').forEach(function (th) {
+      var id = th.dataset.section, items = bySection[id] || [];
+      var ul = $('.cm-list', th);
+      ul.innerHTML = '';
+      if (!items.length) ul.append(el('li', { class: 'cm-empty' },
+        commentsBlocked ? 'Comments are switched off until the Firebase rules are updated.'
+          : mode === 'shared' && !commentsReady ? 'Loading comments…' : 'No comments yet.'));
+      items.forEach(function (c) {
+        ul.append(el('li', { class: 'cm-item', 'data-id': c.id }, [
+          el('div', { class: 'cm-meta' }, [
+            el('b', null, commentAuthor(c)),
+            c._at || c._created ? el('span', null, ' · ' + fmtWhen(c._at || c._created)) : null,
+            c.area ? el('span', { class: 'cm-tag' }, c.area) : null,
+            el('button', { type: 'button', class: 'icon-btn danger cm-del', 'data-cm': 'delete', title: 'Delete comment', 'aria-label': 'Delete comment' }, '✕')
+          ]),
+          el('div', { class: 'cm-body' }, c.text)
+        ]));
+      });
+      var tog = $('#capMap .cm-toggle' + sectionSel(id));
+      if (tog) $('.cm-label', tog).textContent = items.length ? items.length + (items.length === 1 ? ' comment' : ' comments') : 'Comment';
+      if (tog) tog.classList.toggle('has', items.length > 0);
+    });
+
+    $$('#capMap .cm-row').forEach(function (row) {
+      var items = bySection[row.dataset.section] || [];
+      $$('.cm-tile', row).forEach(function (t) {
+        var n = items.filter(function (c) { return c.area === t.dataset.area; }).length;
+        var badge = $('.cm-tc', t);
+        badge.hidden = !n;
+        badge.textContent = n ? '💬 ' + n : '';
+      });
+    });
+
+    var total = state.comments.length;
+    var tot = $('#cmTotal'); if (tot) tot.textContent = total;
+    var cc = $('#count-comments'); if (cc) cc.textContent = total || '';
+  }
+
+  function openThread(id, area) {
+    var th = $('#capMap .cm-thread' + sectionSel(id));
+    if (!th) return;
+    th.hidden = false;
+    var tog = $('#capMap .cm-toggle' + sectionSel(id));
+    if (tog) tog.setAttribute('aria-expanded', 'true');
+    var sel = $('.cm-area', th);
+    if (sel && area != null) sel.value = area;
+    var ta = $('.cm-text', th);
+    if (ta && !readOnly) ta.focus({ preventScroll: true });
+    th.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  function postComment(form) {
+    if (readOnly) return;
+    if (commentsBlocked) { toast('Comments are switched off until the Firebase rules are updated.'); return; }
+    var ta = $('.cm-text', form), text = ta.value.trim();
+    if (!text) { ta.focus(); return; }
+    if (backend === 'firebase' && !meName) {
+      toast('Add your name (top right) first, so others know who commented.');
+      var n = $('#myName'); if (n) n.focus();
+      return;
+    }
+    var sel = $('.cm-area', form);
+    var c = { id: uid(), section: form.dataset.section, area: sel ? sel.value : '', text: text, _created: Date.now() };
+    Object.assign(c, authorMeta());
+    ta.value = '';
+    state.comments.push(c);
+    renderCapComments();
+    if (mode === 'local') { saveLocal(); return; }
+    var key = 'comments/' + c.id;
+    activeWrites++;
+    setStatus('Saving…');
+    var body = Object.assign({}, c); delete body.id;
+    var p = db.collection('comments').doc(c.id).set(body);
+    creating[key] = p;
+    p.then(null, function (e) {
+      state.comments = state.comments.filter(function (x) { return x.id !== c.id; });
+      if (!ta.value) ta.value = text;   // give the text back so it isn't lost
+      renderCapComments();
+      var code = errCode(e);
+      if (code === 'permission_denied' || code === 'unauthenticated') {
+        commentsBlocked = true;
+        banner('Your comment wasn’t saved: the Firebase rules don’t include “comments” yet. Ask the assessment owner to update the rules (see README).', 'warn', 'comments');
+      } else handleWriteError(e, 'comments', c.id);
+    }).then(function () { delete creating[key]; activeWrites--; updateSaveStatus(); });
+  }
+
+  function deleteComment(id) {
+    var c = state.comments.filter(function (x) { return x.id === id; })[0];
+    if (!c || readOnly) return;
+    askConfirm('Delete comment?', '“' + (c.text.length > 80 ? c.text.slice(0, 80) + '…' : c.text) + '” will be removed' + (mode === 'shared' ? ' for everyone' : '') + '.', 'Delete', true)
+      .then(function (ok) {
+        if (!ok) return;
+        state.comments = state.comments.filter(function (x) { return x.id !== id; });
+        renderCapComments();
+        if (mode === 'local') return saveLocal();
+        var before = creating['comments/' + id] || Promise.resolve();
+        before.then(function () { return db.collection('comments').doc(id).delete(); })
+          .catch(function (e) {
+            if (errCode(e) === 'permission_denied') { banner('That comment couldn’t be deleted: the Firebase rules don’t include “comments” yet.', 'warn', 'comments'); return; }
+            handleWriteError(e, 'comments', null);
+          });
+      });
+  }
+
+  function bindCapMap() {
+    var host = $('#capMap');
+    host.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-cm]');
+      if (!b) return;
+      switch (b.dataset.cm) {
+        case 'filter': cmFilter = b.dataset.f; applyCapFilter(); break;
+        case 'toggle':
+          var th = $('#capMap .cm-thread' + sectionSel(b.dataset.section));
+          if (th.hidden) openThread(b.dataset.section, null);
+          else { th.hidden = true; b.setAttribute('aria-expanded', 'false'); }
+          break;
+        case 'tile': openThread(b.closest('.cm-row').dataset.section, b.dataset.area); break;
+        case 'delete': deleteComment(b.closest('.cm-item').dataset.id); break;
+      }
+    });
+    host.addEventListener('submit', function (e) {
+      if (!e.target.classList.contains('cm-form')) return;
+      e.preventDefault();
+      postComment(e.target);
+    });
+    host.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.classList.contains('cm-text')) {
+        e.preventDefault();
+        postComment(e.target.closest('form'));
+      }
+    });
+  }
   /* ---------------- import / export ---------------- */
   function download(name, text, type) {
     if (inViewer) {
@@ -924,7 +1212,7 @@
   }
 
   function exportJSON() {
-    var out = { version: 1, exportedAt: new Date().toISOString(), answers: state.answers, clients: state.clients, team: state.team };
+    var out = { version: 1, exportedAt: new Date().toISOString(), answers: state.answers, clients: state.clients, team: state.team, comments: state.comments };
     download('org-assessment-' + stamp() + '.json', JSON.stringify(out, null, 2), 'application/json');
   }
 
@@ -933,7 +1221,7 @@
     try { parsed = JSON.parse(text); } catch (e) { toast('That file is not valid JSON.'); return; }
     var ns = normalize(parsed);
     askConfirm('Replace all data?',
-      'This replaces every answer, client and team row' + (mode === 'shared' ? ' for everyone' : '') + ' with the backup (' + ns.clients.length + ' clients, ' + ns.team.length + ' people). Export a backup first if you might need the current data.',
+      'This replaces every answer, client and team row and comment' + (mode === 'shared' ? ' for everyone' : '') + ' with the backup (' + ns.clients.length + ' clients, ' + ns.team.length + ' people, ' + ns.comments.length + ' comments). Export a backup first if you might need the current data.',
       'Replace', true)
       .then(function (ok) { if (ok) replaceAll(ns); });
   }
@@ -950,6 +1238,7 @@
   function renderAll() {
     renderQuestions();
     KINDS.forEach(renderTable);
+    renderCapMap();
     refreshDatalists();
     applyReadOnly();
     route();
@@ -1010,14 +1299,16 @@
         case 'import-json': pickFile('json', '.json,application/json'); break;
         case 'reset':
           askConfirm('Clear all data?',
-            mode === 'shared' ? 'This deletes every answer, client and team row for everyone using this assessment. Export a backup first if you might need it.'
-              : 'This deletes all answers, clients and team data stored in this browser. Export a backup first if you might need it.',
+            mode === 'shared' ? 'This deletes every answer, client and team row and comment for everyone using this assessment. Export a backup first if you might need it.'
+              : 'This deletes all answers, clients, team data and comments stored in this browser. Export a backup first if you might need it.',
             'Clear everything', true)
             .then(function (ok) { if (ok) replaceAll(emptyState()); });
           break;
       }
     });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') $('#dataMenu').hidden = true; });
+
+    bindCapMap();
 
     $('#fileInput').addEventListener('change', function (e) {
       var file = e.target.files[0];
@@ -1035,6 +1326,7 @@
   function startLocal(notice) {
     mode = 'local';
     loaded = { clients: true, team: true, answers: true };
+    commentsReady = true;
     if (notice) banner(notice, 'warn', 'mode');
     setIntro('Answers save automatically in this browser only. Use Data → Export to back them up or share them.');
     return loadLocal().then(function () {

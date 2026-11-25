@@ -5,6 +5,7 @@ A small static website for recording the current state of the organization:
 1. **Questions**: the start page. Assessment questions, each with a free-text answer box, a progress bar, and who last edited each answer.
 2. **Clients**: an editable table of active clients. Summary cards show average gross margin, G/A/R health, upcoming renewals and open escalations.
 3. **Team**: an editable table of team members. Summary cards show headcount, billable count, allocation, roll-offs, flight risk, AI fluency and monthly cost.
+4. **Capability map**: the biopharma IT capability heat map (content in `js/capability-map.js`). Each domain and note card has a comment thread. Click a tile to comment on that specific area. Comments are stored in the `comments` collection and included in JSON backups. If the Firebase rules don't list `comments`, only commenting stops working. The rest of the site carries on.
 
 It's plain HTML, CSS and JavaScript with no build step. It's hosted on GitHub Pages, and shared data lives in **Firebase Firestore**. There's no sign-in: people open a link that contains an access code (`…/org-assessment/?k=CODE`).
 

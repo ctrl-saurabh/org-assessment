@@ -13,6 +13,7 @@
       <a href="#questions" data-tab="questions">Questions</a>
       <a href="#clients" data-tab="clients">Clients <span class="count" id="count-clients"></span></a>
       <a href="#team" data-tab="team">Team <span class="count" id="count-team"></span></a>
+      <a href="#capability" data-tab="capability">Capability map <span class="count" id="count-comments" title="Comments"></span></a>
     </nav>
     <div class="topbar-actions">
       <span id="saveStatus" class="save-status"></span>
@@ -87,6 +88,11 @@
         <p class="empty" id="empty-team" hidden></p>
       </div>
     </section>
+
+    <!-- Capability map -->
+    <section id="view-capability" class="view" hidden>
+      <div id="capMap"></div>
+    </section>
   </main>
 
   <input type="file" id="fileInput" hidden>
@@ -96,6 +102,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
   <script src="js/config.js"></script>
+  <script src="js/capability-map.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
